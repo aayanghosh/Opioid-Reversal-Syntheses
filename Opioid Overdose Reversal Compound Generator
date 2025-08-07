@@ -1,0 +1,126 @@
+import deepchem as dc
+from rdkit import Chem
+import numpy as np
+from deepchem.models import MultitaskRegressor
+from rdkit.Chem import rdFingerprintGenerator
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+from rdkit.Chem import AllChem
+import random
+
+# Define SMILES and binding affinities specific to mu-1 opioid receptors
+smiles_list = [
+    "C=CCN1CC[C@]23[C@@H]4C(=O)CC[C@]2([C@H]1CC5=C3C(=C(C=C5)O)O4)O",  # Example: Naloxone
+    "C=C1CC[C@]2([C@H]3CC4=C5[C@]2([C@H]1OC5=C(C=C4)O)CCN3CC6CC6)O",  # Example: Nalmefene
+    "C1CC1CN2CC[C@]34[C@@H]5C(=O)CC[C@]3([C@H]2CC6=C4C(=C(C=C6)O)O5)O"  # Example: Naltrexone
+]
+
+binding_affinities = [18.0, 1.0, 0.11]
+
+# Generate Morgan fingerprints
+morgan_generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+molecules = [Chem.MolFromSmiles(smiles) for smiles in smiles_list]
+features = [np.array(morgan_generator.GetFingerprint(mol)) for mol in molecules]
+X = np.array(features, dtype=float)
+
+# Normalize binding affinities
+scaler = StandardScaler()
+y = scaler.fit_transform(np.array(binding_affinities).reshape(-1, 1)).flatten()
+
+# Define model parameters
+n_tasks = 1
+n_features = 2048
+epochs = 30  # Increase epochs for potentially better learning
+
+# Initialize metric
+metric = dc.metrics.Metric(dc.metrics.mae_score)
+
+# K-Fold Cross-Validation
+kf = KFold(n_splits=2, shuffle=True, random_state=42)
+mae_scores = []
+
+for train_index, valid_index in kf.split(X):
+    X_train, X_valid = X[train_index], X[valid_index]
+    y_train, y_valid = y[train_index], y[valid_index]
+
+    # Create DeepChem datasets
+    train_dataset = dc.data.NumpyDataset(X_train, y_train)
+    valid_dataset = dc.data.NumpyDataset(X_valid, y_valid)
+
+    # Initialize and train the model
+    model = MultitaskRegressor(
+        n_tasks=n_tasks,
+        n_features=n_features,
+          layer_sizes=[1500, 1000, 500],  # Adjusted layer sizes to potentially improve learning
+        dropouts=0.3,                  # Slightly increased dropout for better generalization
+        learning_rate=0.0005           # Adjusted learning rate for better convergence
+    )
+    model.fit(train_dataset, nb_epoch=epochs)
+
+    # Evaluate the model on the validation set
+    valid_scores = model.evaluate(valid_dataset, [metric], transformers=[])
+    mae_scores.append(valid_scores['mae_score'])
+
+# Report the average MAE across folds
+average_mae = np.mean(mae_scores)
+print(f"Average Validation MAE across folds: {average_mae}")
+
+# Optionally, retrain on the entire dataset with the best hyperparameters
+final_model = MultitaskRegressor(
+    n_tasks=n_tasks,
+    n_features=n_features,
+    layer_sizes=[1500, 1000, 500],
+    dropouts=0.3,
+    learning_rate=0.0005
+)
+final_dataset = dc.data.NumpyDataset(X, y)
+final_model.fit(final_dataset, nb_epoch=epochs)
+
+# Evaluate the final model on the entire dataset (self-evaluation)
+final_scores = final_model.evaluate(final_dataset, [metric], transformers=[])
+print(f"Final Model MAE on the entire dataset: {final_scores['mae_score']}")
+
+# Predict binding affinities on the entire dataset
+predictions = final_model.predict(final_dataset)
+
+# Print predictions along with their corresponding SMILES
+for i, pred in enumerate(predictions):
+    original_affinity = binding_affinities[i]
+    predicted_affinity = scaler.inverse_transform(pred.reshape(-1, 1)).flatten()[0]
+    smiles = smiles_list[i]
+    print(f"Original SMILES: {smiles}, Original Affinity: {original_affinity}, Predicted Affinity: {predicted_affinity}")
+
+# Function to generate a new molecule by adding or changing a substituent
+def generate_new_molecule(original_mol):
+    # Add a simple modification
+    new_mol = Chem.RWMol(original_mol)
+    atom_idx = random.choice(range(new_mol.GetNumAtoms()))
+    new_mol.GetAtomWithIdx(atom_idx).SetAtomicNum(random.choice([6, 7, 8]))  # Randomly change atom type
+    return new_mol.GetMol()
+
+# Generate new SMILES and predict their binding affinities
+new_smiles_list = []
+new_predictions = []
+
+for i, original_smiles in enumerate(smiles_list):
+    original_mol = Chem.MolFromSmiles(original_smiles)
+    new_mol = generate_new_molecule(original_mol)
+    new_smiles = Chem.MolToSmiles(new_mol)
+    # Continue generating new SMILES and predicting their binding affinities
+    new_smiles_list.append(new_smiles)
+
+    # Generate features for the new molecule
+    new_features = np.array(morgan_generator.GetFingerprint(new_mol), dtype=float)
+    new_features = new_features.reshape(1, -1)
+
+    # Predict binding affinity for the new molecule
+    new_dataset = dc.data.NumpyDataset(new_features)
+    new_pred = final_model.predict(new_dataset)
+    predicted_affinity = scaler.inverse_transform(new_pred.reshape(-1, 1)).flatten()[0]
+    new_predictions.append(predicted_affinity)
+
+    print(f"Generated SMILES: {new_smiles}, Predicted Affinity: {predicted_affinity}")
+
+# Optional: Evaluate the novelty of generated SMILES
+unique_new_smiles = set(new_smiles_list)
+print(f"Unique generated SMILES: {unique_new_smiles}")
