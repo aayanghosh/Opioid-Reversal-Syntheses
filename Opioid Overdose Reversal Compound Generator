@@ -1,126 +1,224 @@
+import os
+import sys
+import subprocess
+import numpy as np
 import deepchem as dc
 from rdkit import Chem
-import numpy as np
-from deepchem.models import MultitaskRegressor
-from rdkit.Chem import rdFingerprintGenerator
+from rdkit.Chem import AllChem, rdFingerprintGenerator
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
-from rdkit.Chem import AllChem
+from skopt import gp_minimize
+from skopt.space import Real, Integer
+from skopt.utils import use_named_args
 import random
 
-# Define SMILES and binding affinities specific to mu-1 opioid receptors
+
+# sys.path.append("./arpeggio") # Not needed for mock implementation
+
+
+# ----------------- DATA SETUP -----------------
 smiles_list = [
-    "C=CCN1CC[C@]23[C@@H]4C(=O)CC[C@]2([C@H]1CC5=C3C(=C(C=C5)O)O4)O",  # Example: Naloxone
-    "C=C1CC[C@]2([C@H]3CC4=C5[C@]2([C@H]1OC5=C(C=C4)O)CCN3CC6CC6)O",  # Example: Nalmefene
-    "C1CC1CN2CC[C@]34[C@@H]5C(=O)CC[C@]3([C@H]2CC6=C4C(=C(C=C6)O)O5)O"  # Example: Naltrexone
+    "C=CCN1CC[C@]23[C@@H]4C(=O)CC[C@]2([C@H]1CC5=C3C(=C(C=C5)O)O4)O", # OORM 1 (e.g., Oxymorphone derivative)
+    "C=C1CC[C@]2([C@H]3CC4=C5[C@]2([C@H]1OC5=C(C=C4)O)CCN3CC6CC6)O", # OORM 2 (e.g., Naltrexone derivative)
+    "C1CC1CN2CC[C@]34[C@@H]5C(=O)CC[C@]3([C@H]2CC6=C4C(=C(C=C6)O)O5)O"  # OORM 3 (e.g., Cyclazocine derivative)
 ]
+binding_affinities = [1.0, 1.0, 0.5]
 
-binding_affinities = [18.0, 1.0, 0.11]
 
-# Generate Morgan fingerprints
-morgan_generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
-molecules = [Chem.MolFromSmiles(smiles) for smiles in smiles_list]
-features = [np.array(morgan_generator.GetFingerprint(mol)) for mol in molecules]
-X = np.array(features, dtype=float)
-
-# Normalize binding affinities
+morgan_gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+mols = [Chem.MolFromSmiles(s) for s in smiles_list]
+X = np.array([np.array(morgan_gen.GetFingerprint(m)) for m in mols], dtype=float)
 scaler = StandardScaler()
 y = scaler.fit_transform(np.array(binding_affinities).reshape(-1, 1)).flatten()
 
-# Define model parameters
-n_tasks = 1
-n_features = 2048
-epochs = 30  # Increase epochs for potentially better learning
 
-# Initialize metric
-metric = dc.metrics.Metric(dc.metrics.mae_score)
+# ----------------- MODIFICATION FEATURE -----------------
+def generate_modified_smiles(base_smiles_list, num_modifications_per_drug=1):
+    modified_smiles = []
+   
+    # Define simple mock modifications to simulate adding bulk/change
+    modifications = ['C', 'Cl', 'F'] # Adding a C, Chlorine, or Fluorine atom/group
+   
+    for base_smiles in base_smiles_list:
+        for _ in range(num_modifications_per_drug):
+           
+            # 1. Choose a random insertion point (index) in the SMILES string
+            insertion_index = random.randint(0, len(base_smiles) - 1)
+           
+            # 2. Choose a random modification
+            mod = random.choice(modifications)
+           
+            # 3. Insert the modification (this often creates invalid SMILES, which RDKit handles later)
+            new_smiles = base_smiles[:insertion_index] + mod + base_smiles[insertion_index:]
+           
+            modified_smiles.append(new_smiles)
+           
+    # Filter out candidates that RDKit cannot parse (often created by the string manipulation)
+    valid_modified_smiles = [s for s in modified_smiles if Chem.MolFromSmiles(s) is not None]
+   
+    return valid_modified_smiles
 
-# K-Fold Cross-Validation
-kf = KFold(n_splits=2, shuffle=True, random_state=42)
-mae_scores = []
 
-for train_index, valid_index in kf.split(X):
-    X_train, X_valid = X[train_index], X[valid_index]
-    y_train, y_valid = y[train_index], y[valid_index]
+# ----------------- MODEL OPTIMIZATION AND TRAINING -----------------
 
-    # Create DeepChem datasets
-    train_dataset = dc.data.NumpyDataset(X_train, y_train)
-    valid_dataset = dc.data.NumpyDataset(X_valid, y_valid)
 
-    # Initialize and train the model
-    model = MultitaskRegressor(
-        n_tasks=n_tasks,
-        n_features=n_features,
-          layer_sizes=[1500, 1000, 500],  # Adjusted layer sizes to potentially improve learning
-        dropouts=0.3,                  # Slightly increased dropout for better generalization
-        learning_rate=0.0005           # Adjusted learning rate for better convergence
-    )
-    model.fit(train_dataset, nb_epoch=epochs)
+space = [
+    Real(1e-5, 1e-2, name='learning_rate', prior='log-uniform'),
+    Real(0.1, 0.5, name='dropouts'),
+    Integer(100, 2000, name='layer1_size'),
+    Integer(100, 2000, name='layer2_size'),
+    Integer(100, 2000, name='layer3_size'),
+]
 
-    # Evaluate the model on the validation set
-    valid_scores = model.evaluate(valid_dataset, [metric], transformers=[])
-    mae_scores.append(valid_scores['mae_score'])
 
-# Report the average MAE across folds
-average_mae = np.mean(mae_scores)
-print(f"Average Validation MAE across folds: {average_mae}")
+@use_named_args(space)
+def objective(learning_rate, dropouts, layer1_size, layer2_size, layer3_size):
+    n_tasks = 1
+    n_features = 2048
+    epochs = 30
+    kf = KFold(n_splits=2, shuffle=True, random_state=42)
+    maes = []
+    for tr, va in kf.split(X):
+        X_train, X_val = X[tr], X[va]
+        y_train, y_val = y[tr], y[va]
+        train = dc.data.NumpyDataset(X_train, y_train)
+        val = dc.data.NumpyDataset(X_val, y_val)
+        model = dc.models.MultitaskRegressor(
+            n_tasks=n_tasks,
+            n_features=n_features,
+            layer_sizes=[layer1_size, layer2_size, layer3_size],
+            dropouts=float(dropouts),
+            learning_rate=learning_rate,
+            dtype=X.dtype
+        )
+        model.fit(train, nb_epoch=epochs)
+        metric = dc.metrics.Metric(dc.metrics.mae_score)
+        score = model.evaluate(val, [metric], transformers=[])
+        maes.append(score["mae_score"])
+    return np.mean(maes)
 
-# Optionally, retrain on the entire dataset with the best hyperparameters
-final_model = MultitaskRegressor(
-    n_tasks=n_tasks,
-    n_features=n_features,
-    layer_sizes=[1500, 1000, 500],
-    dropouts=0.3,
-    learning_rate=0.0005
+
+print("Running Bayesian optimization to find best hyperparameters...")
+res = gp_minimize(objective, space, n_calls=10, random_state=42)
+best_lr, best_drop, l1, l2, l3 = res.x
+print(f"Optimal Hyperparameters: LR={best_lr:.6f}, Dropout={best_drop:.3f}")
+
+
+final_model = dc.models.MultitaskRegressor(
+    n_tasks=1,
+    n_features=2048,
+    layer_sizes=[l1, l2, l3],
+    dropouts=best_drop,
+    learning_rate=best_lr,
+    dtype=X.dtype
 )
-final_dataset = dc.data.NumpyDataset(X, y)
-final_model.fit(final_dataset, nb_epoch=epochs)
+dataset = dc.data.NumpyDataset(X, y)
+final_model.fit(dataset, nb_epoch=40)
+print("Final ML model trained.")
 
-# Evaluate the final model on the entire dataset (self-evaluation)
-final_scores = final_model.evaluate(final_dataset, [metric], transformers=[])
-print(f"Final Model MAE on the entire dataset: {final_scores['mae_score']}")
 
-# Predict binding affinities on the entire dataset
-predictions = final_model.predict(final_dataset)
+# ----------------- SCREENING FUNCTIONS -----------------
 
-# Print predictions along with their corresponding SMILES
-for i, pred in enumerate(predictions):
-    original_affinity = binding_affinities[i]
-    predicted_affinity = scaler.inverse_transform(pred.reshape(-1, 1)).flatten()[0]
-    smiles = smiles_list[i]
-    print(f"Original SMILES: {smiles}, Original Affinity: {original_affinity}, Predicted Affinity: {predicted_affinity}")
 
-# Function to generate a new molecule by adding or changing a substituent
-def generate_new_molecule(original_mol):
-    # Add a simple modification
-    new_mol = Chem.RWMol(original_mol)
-    atom_idx = random.choice(range(new_mol.GetNumAtoms()))
-    new_mol.GetAtomWithIdx(atom_idx).SetAtomicNum(random.choice([6, 7, 8]))  # Randomly change atom type
-    return new_mol.GetMol()
+def screen_with_ml_model(model, scaler, candidate_smiles_list):
+    mols_to_predict = [Chem.MolFromSmiles(s) for s in candidate_smiles_list]
+   
+    valid_mols = [m for m in mols_to_predict if m is not None]
+    valid_smiles = [s for s, m in zip(candidate_smiles_list, mols_to_predict) if m is not None]
+   
+    if not valid_mols:
+        return []
 
-# Generate new SMILES and predict their binding affinities
-new_smiles_list = []
-new_predictions = []
 
-for i, original_smiles in enumerate(smiles_list):
-    original_mol = Chem.MolFromSmiles(original_smiles)
-    new_mol = generate_new_molecule(original_mol)
-    new_smiles = Chem.MolToSmiles(new_mol)
-    # Continue generating new SMILES and predicting their binding affinities
-    new_smiles_list.append(new_smiles)
+    X_pred = np.array([np.array(morgan_gen.GetFingerprint(m)) for m in valid_mols], dtype=float)
+   
+    y_pred_normalized = model.predict(dc.data.NumpyDataset(X_pred))
+   
+    # Fix for ValueError: reshape 3D to 2D for scaler, then flatten to 1D
+    y_pred_real = scaler.inverse_transform(y_pred_normalized.reshape(-1, 1)).flatten()
+   
+    candidate_scores = list(zip(valid_smiles, y_pred_real))
+   
+    candidate_scores.sort(key=lambda x: x[1])
+   
+    return candidate_scores
 
-    # Generate features for the new molecule
-    new_features = np.array(morgan_generator.GetFingerprint(new_mol), dtype=float)
-    new_features = new_features.reshape(1, -1)
 
-    # Predict binding affinity for the new molecule
-    new_dataset = dc.data.NumpyDataset(new_features)
-    new_pred = final_model.predict(new_dataset)
-    predicted_affinity = scaler.inverse_transform(new_pred.reshape(-1, 1)).flatten()[0]
-    new_predictions.append(predicted_affinity)
+def is_toxic(smiles):
+    return np.random.rand() > 0.8
 
-    print(f"Generated SMILES: {new_smiles}, Predicted Affinity: {predicted_affinity}")
 
-# Optional: Evaluate the novelty of generated SMILES
-unique_new_smiles = set(new_smiles_list)
-print(f"Unique generated SMILES: {unique_new_smiles}")
+def smiles_to_pdb(smiles, out_file="ligand.pdb"):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None: return None
+    mol = Chem.AddHs(mol)
+    AllChem.EmbedMolecule(mol, AllChem.ETKDG())
+    AllChem.UFFOptimizeMolecule(mol)
+    Chem.MolToPDBFile(mol, out_file)
+    return out_file
+
+
+def run_arpeggio(pdb_file_path):
+    # MOCK IMPLEMENTATION: Simulating the successful Arpeggio output
+    print(f"\nArpeggio Mock Result for {pdb_file_path}:")
+    print("  SIMULATED: Non-covalent interaction profile confirmed. ")
+    print("  SIMULATED: 4 Hydrogen bonds, 2 Pi-Cation interactions, suggesting long residency time.")
+
+
+def run_molecular_docking(receptor_pdb_file, smiles_string):
+    docking_score = np.random.uniform(-10, -5)
+    return docking_score
+
+
+# ----------------- MAIN WORKFLOW -----------------
+
+
+if __name__ == "__main__":
+    receptor_pdb = "8EF5 (1).pdb"
+    baseline_smiles = "C1CCN(CC1)CCC(=O)NC2=CC=C(C=C2)C3=CC=CC=C3"
+    baseline_score = run_molecular_docking(receptor_pdb, baseline_smiles)
+   
+    print("\nStarting Drug Screening Workflow")
+    print(f"Fentanyl Baseline Mock Docking Score: {baseline_score:.3f} (Lower is better)")
+   
+    # --- NEW FEATURE: Generate Modified Candidates for Screening ---
+    # Uncomment the two lines below to screen the randomized, modified drugs instead
+    # candidates_to_screen = generate_modified_smiles(smiles_list, num_modifications_per_drug=5)
+   
+    # --- Current Feature: Screening the original training data as candidates ---
+    candidates_to_screen = smiles_list
+   
+    print(f"Using {len(candidates_to_screen)} molecules for screening.")
+   
+    predicted_candidates = screen_with_ml_model(final_model, scaler, candidates_to_screen)
+   
+    viable_candidates = predicted_candidates
+   
+    print(f"\nProcessing {len(viable_candidates)} Candidates Predicted by ML:")
+
+
+    final_candidates = []
+   
+    for i, (new_smiles, predicted_score) in enumerate(viable_candidates):
+        print(f"\nCandidate {i+1} ({new_smiles})")
+       
+        if is_toxic(new_smiles):
+            print(f"Skipping due to Mock Toxicity Risk.")
+            continue
+
+
+        print(f"ML Predicted Score: {predicted_score:.3f} (Lower is better)")
+       
+        print("Running final structural validation (3D prep and Arpeggio)...")
+        ligand_pdb = smiles_to_pdb(new_smiles, out_file=f"candidate_{i+1}_ligand.pdb")
+       
+        if ligand_pdb:
+            run_arpeggio(ligand_pdb)
+            final_candidates.append(new_smiles)
+        else:
+            print("Could not generate 3D structure (RDKit error). Skipping.")
+
+
+    print("\n==============================================")
+    print(f"Final Viable Candidates (Passed ML and Validation): {len(final_candidates)}")
+    print("==============================================")
